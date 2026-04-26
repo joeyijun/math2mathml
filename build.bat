@@ -15,7 +15,7 @@ if errorlevel 1 (
 echo [INFO] 开始打包...
 echo.
 
-pyinstaller --onefile --noconsole --strip ^
+pyinstaller --clean --onefile --noconsole --strip ^
     --name MathFlow ^
     --icon=icon.ico ^
     --hidden-import ttkbootstrap ^

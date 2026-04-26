@@ -113,6 +113,7 @@ class MathFlowApp:
             tray_img = create_tray_image()
             self.tk_icon = ImageTk.PhotoImage(tray_img)
             self.root.iconphoto(False, self.tk_icon)
+            self.root.iconphoto(True, self.tk_icon)
         except Exception:
             pass
         
@@ -163,7 +164,7 @@ class MathFlowApp:
                   bootstyle="secondary").pack(pady=(0, 25))
 
         # API Key + 显隐切换
-        ttk.Label(main_frame, text="🔑 API Key (必填)", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(0, 5))
+        ttk.Label(main_frame, text="🔑 API Key (截图识别需配置，纯转换功能选填)", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(0, 5))
         key_frame = ttk.Frame(main_frame)
         key_frame.pack(fill=X, pady=(0, 15))
         self.entry_key = ttk.Entry(key_frame, show="*")
@@ -223,8 +224,8 @@ class MathFlowApp:
 
     def start_main(self):
         if not self.entry_key.get().strip():
-            messagebox.showwarning("提示", "API Key 不能为空！", parent=self.root)
-            return
+            if not messagebox.askyesno("提示", "API Key 为空，截图识别公式功能将不可用，\n您只能使用 LaTeX 转 MathML 功能。\n\n是否继续？", parent=self.root):
+                return
         if not self.combo_url.get().strip() or not self.combo_model.get().strip():
             messagebox.showwarning("提示", "接口地址和模型名称不能为空！", parent=self.root)
             return
@@ -314,6 +315,10 @@ is_processing = False  # 防止图像识别重复触发
 def on_image_hotkey_pressed(api_key, base_url, model_name):
     global is_processing, tray_icon
     if is_processing:
+        return
+    if not api_key or not api_key.strip():
+        if tray_icon:
+            tray_icon.notify("未配置 API Key，无法使用截图识别功能！\n请右键托盘图标进入设置配置 API Key。", "MathFlow 提示")
         return
     is_processing = True
 
