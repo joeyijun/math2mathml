@@ -134,7 +134,7 @@ class MathFlowApp:
         self.root.deiconify()
     
     def _on_close(self):
-        if messagebox.askokcancel("MathFlow", "确定要退出吗？\n点击“取消”可返回继续配置。"):
+        if messagebox.askokcancel("MathFlow", "确定要退出吗？\n点击“取消”可返回继续配置。", parent=self.root):
             self.root.quit()
             self.root.destroy()
 
@@ -190,7 +190,7 @@ class MathFlowApp:
         self.combo_url.pack(fill=X, pady=(0, 15))
 
         # Model Name
-        ttk.Label(main_frame, text="🤖 模型名称 (支持手写输入新模型)", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(0, 5))
+        ttk.Label(main_frame, text="🤖 模型名称 (支持输入新模型)", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(0, 5))
         models = [
             "qwen3-vl-flash", "qwen3-vl-plus",
             "glm-4v", "glm-4v-plus",
@@ -223,10 +223,10 @@ class MathFlowApp:
 
     def start_main(self):
         if not self.entry_key.get().strip():
-            messagebox.showwarning("提示", "API Key 不能为空！")
+            messagebox.showwarning("提示", "API Key 不能为空！", parent=self.root)
             return
         if not self.combo_url.get().strip() or not self.combo_model.get().strip():
-            messagebox.showwarning("提示", "接口地址和模型名称不能为空！")
+            messagebox.showwarning("提示", "接口地址和模型名称不能为空！", parent=self.root)
             return
         self.save_config()
         self.should_run = True

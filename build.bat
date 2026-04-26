@@ -17,6 +17,7 @@ echo.
 
 pyinstaller --onefile --noconsole --strip ^
     --name MathFlow ^
+    --icon=icon.ico ^
     --hidden-import ttkbootstrap ^
     --collect-data ttkbootstrap ^
     --collect-data latex2mathml ^
