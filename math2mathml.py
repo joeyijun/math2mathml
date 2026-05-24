@@ -1,6 +1,6 @@
 import keyboard
 import latex2mathml.converter
-from PIL import ImageGrab, Image, ImageDraw, ImageFont
+from PIL import ImageGrab, Image, ImageDraw, ImageFont, ImageOps
 import io
 import base64
 import time
@@ -19,6 +19,24 @@ import threading
 import ctypes
 
 CONFIG_FILE = "config.json"
+DEFAULT_CONFIG = {
+    "api_key": "",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen-vl-max",
+    "image_max_edge": 1600,
+    "jpeg_quality": 90,
+    "request_timeout": 45,
+    "request_retries": 2
+}
+
+VISION_PROMPT = (
+    "You are an expert mathematician and OCR engine. Transcribe the mathematical "
+    "formula in the image into valid, standard LaTeX. Output ONLY raw LaTeX, with "
+    "no markdown, explanation, or surrounding text. If multiple lines are visible, "
+    "wrap them in \\begin{array}{rl} ... \\end{array} and use \\\\ for line breaks. "
+    "Do not use aligned. Preserve fractions, radicals, matrices, Greek letters, "
+    "superscripts, subscripts, accents, limits, and piecewise structures exactly."
+)
 
 # --- Win32 剪贴板操作 (替代 pyperclip，节省打包体积) ---
 CF_UNICODETEXT = 13
@@ -117,11 +135,7 @@ class MathFlowApp:
         except Exception:
             pass
         
-        self.config = {
-            "api_key": "",
-            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "model_name": "qwen-vl-max"
-        }
+        self.config = DEFAULT_CONFIG.copy()
         self.load_config()
         self.should_run = False
         self._key_visible = False
@@ -239,16 +253,141 @@ def _truncate_error(e, max_len=60):
     msg = str(e)
     return msg[:max_len] + "..." if len(msg) > max_len else msg
 
-def image_to_base64(img):
+def _coerce_int(value, default, min_value=None, max_value=None):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def load_runtime_config():
+    conf = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            conf.update(json.load(f))
+    conf["image_max_edge"] = _coerce_int(conf.get("image_max_edge"), DEFAULT_CONFIG["image_max_edge"], 800, 4096)
+    conf["jpeg_quality"] = _coerce_int(conf.get("jpeg_quality"), DEFAULT_CONFIG["jpeg_quality"], 60, 95)
+    conf["request_timeout"] = _coerce_int(conf.get("request_timeout"), DEFAULT_CONFIG["request_timeout"], 10, 180)
+    conf["request_retries"] = _coerce_int(conf.get("request_retries"), DEFAULT_CONFIG["request_retries"], 0, 5)
+    return conf
+
+def load_clipboard_image():
+    img = ImageGrab.grabclipboard()
+    if img is None:
+        return None
+    if isinstance(img, Image.Image):
+        return img
+    if isinstance(img, list):
+        for path in img:
+            try:
+                if os.path.isfile(path):
+                    with Image.open(path) as file_img:
+                        return file_img.copy()
+            except (OSError, ValueError):
+                continue
+        raise RuntimeError("剪贴板中没有可读取的图片文件")
+    raise RuntimeError("剪贴板内容不是图片")
+
+def prepare_image_for_ocr(img, max_edge=1600):
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        canvas = Image.new("RGB", img.size, "white")
+        alpha = img.convert("RGBA").getchannel("A")
+        canvas.paste(img.convert("RGB"), mask=alpha)
+        img = canvas
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    longest = max(img.size)
+    if longest > max_edge:
+        scale = max_edge / longest
+        new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    return img
+
+def image_to_base64(img, quality=90):
     buffered = io.BytesIO()
-    img.save(buffered, format="JPEG", quality=85)  # JPEG 比 PNG 体积小 ~60%，OCR 足够
+    img.save(buffered, format="JPEG", quality=quality, optimize=True)
     result = base64.b64encode(buffered.getvalue()).decode('utf-8')
     buffered.close()
     return result
 
+def build_chat_endpoint(base_url):
+    base_url = (base_url or "").strip()
+    if not base_url:
+        raise RuntimeError("API 接口地址不能为空")
+    normalized = base_url.rstrip('/')
+    if normalized.endswith('/chat/completions'):
+        return normalized
+    return normalized + '/chat/completions'
+
+def extract_latex_from_response(result_json):
+    try:
+        content = result_json['choices'][0]['message']['content']
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"模型返回格式异常: {e}")
+
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
+                parts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                parts.append(part)
+        content = "\n".join(parts)
+
+    content = str(content).strip()
+    if not content:
+        raise RuntimeError("模型未返回 LaTeX 内容")
+    return content
+
+def request_latex_from_image(api_key, base_url, model_name, base64_image, timeout=45, retries=2):
+    api_endpoint = build_chat_endpoint(base_url)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    data = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": VISION_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+        ]}],
+        "temperature": 0.0,
+        "max_tokens": 1200
+    }
+
+    payload = json.dumps(data).encode('utf-8')
+    last_error = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(api_endpoint, data=payload, headers=headers, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                result_json = json.loads(response.read().decode('utf-8'))
+                return extract_latex_from_response(result_json)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='ignore')
+            last_error = RuntimeError(f"HTTP {e.code}: {body or e.reason}")
+            if e.code not in (408, 429) and e.code < 500:
+                break
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            last_error = e
+
+        if attempt < retries:
+            time.sleep(min(1.5 * (attempt + 1), 5))
+
+    raise RuntimeError(f"HTTP/网络错误: {last_error}")
+
 def clean_latex(latex_str):
     """清理 AI 或用户输入中可能携带的多余标记"""
-    latex_str = latex_str.strip()
+    latex_str = str(latex_str).strip().replace('\u200b', '')
+    fenced = re.search(r'```(?:latex|tex|math)?\s*(.*?)\s*```', latex_str, flags=re.I | re.S)
+    if fenced:
+        latex_str = fenced.group(1).strip()
     # 剥离代码块围栏
     for fence in ('```latex', '```math', '```'):
         if latex_str.startswith(fence):
@@ -267,6 +406,17 @@ def clean_latex(latex_str):
         latex_str = latex_str[2:-2].strip()
     elif latex_str.startswith(r'\(') and latex_str.endswith(r'\)'):
         latex_str = latex_str[2:-2].strip()
+    latex_str = re.sub(r'^(?:latex|tex|answer|result|结果|答案)\s*[:：]\s*', '', latex_str, flags=re.I).strip()
+    if latex_str.startswith('$$') and latex_str.endswith('$$'):
+        latex_str = latex_str[2:-2].strip()
+    elif latex_str.startswith('$') and latex_str.endswith('$'):
+        latex_str = latex_str[1:-1].strip()
+    if latex_str.startswith(r'\[') and latex_str.endswith(r'\]'):
+        latex_str = latex_str[2:-2].strip()
+    elif latex_str.startswith(r'\(') and latex_str.endswith(r'\)'):
+        latex_str = latex_str[2:-2].strip()
+    if latex_str.upper() in ("NO_MATH", "NONE", "NULL"):
+        raise RuntimeError("未识别到公式")
     return latex_str
 
 # 预编译正则：避免每次调用 to_office_mathml 时重复编译
@@ -322,50 +472,25 @@ def on_image_hotkey_pressed(api_key, base_url, model_name):
         return
     is_processing = True
 
-    img = ImageGrab.grabclipboard()
+    img = load_clipboard_image()
     if img is None:
         if tray_icon:
             tray_icon.notify("\u526a\u8d34\u677f\u91cc\u6ca1\u6709\u56fe\u7247\uff01\u8bf7\u5148\u622a\u56fe\u3002", "MathFlow \u63d0\u793a")
         is_processing = False
         return
     try:
-        # grabclipboard 在有些截图工具下返回的是文件路径列表而非 Image
-        if isinstance(img, list):
-            img = Image.open(img[0])
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-
-        base64_image = image_to_base64(img)
+        conf = load_runtime_config()
+        img = prepare_image_for_ocr(img, conf["image_max_edge"])
+        base64_image = image_to_base64(img, conf["jpeg_quality"])
         del img  # 尽早释放截图对象
-        
-        # 使用内置的 urllib 替代重型的 openai 库（可大幅降低 PyInstaller 构建体积，极大节省内容占用）
-        if not base_url.endswith('/'):
-            base_url += '/'
-        api_endpoint = base_url if "chat/completions" in base_url else base_url + "chat/completions"
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        data = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "You are an expert mathematician and OCR engine. Your task is to transcribe the mathematical formulas in the provided image into valid, standard LaTeX. Output ONLY the raw LaTeX representation of the visible math. Math equations should be properly formatted. IMPORTANT: If there are multiple lines of equations, wrap them in a \\begin{array}{rl} ... \\end{array} block (DO NOT use aligned) and use \\\\ for line breaks. Do not include markdown code blocks like ```latex or ```. Ensure superscripts, subscripts, fractions, matrices, and greek letters are precisely transcribed."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-            ]}],
-            "temperature": 0.1
-        }
-        req = urllib.request.Request(api_endpoint, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
-        
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result_json = json.loads(response.read().decode('utf-8'))
-                latex_result = result_json['choices'][0]['message']['content']
-        except urllib.error.URLError as http_e:
-            err_msg = str(http_e)
-            if hasattr(http_e, 'read'):
-                err_msg += " " + http_e.read().decode('utf-8', errors='ignore')
-            raise RuntimeError(f"HTTP/网络错误: {err_msg}")
+        latex_result = request_latex_from_image(
+            api_key,
+            base_url,
+            model_name,
+            base64_image,
+            timeout=conf["request_timeout"],
+            retries=conf["request_retries"]
+        )
         del base64_image  # 释放 base64 字符串
         clean_expr = clean_latex(latex_result)
         clipboard_copy(to_office_mathml(clean_expr))
@@ -443,8 +568,7 @@ def quit_action(icon, item):
 # --- 主程序入口 ---
 def load_and_apply_config():
     global tray_icon
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        conf = json.load(f)
+    conf = load_runtime_config()
         
     keyboard.unhook_all()
     keyboard.add_hotkey('alt+i', lambda: threading.Thread(

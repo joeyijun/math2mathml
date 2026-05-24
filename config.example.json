@@ -1,5 +1,9 @@
 {
     "api_key": "YOUR_API_KEY_HERE",
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "model_name": "qwen-vl-max"
+    "model_name": "qwen-vl-max",
+    "image_max_edge": 1600,
+    "jpeg_quality": 90,
+    "request_timeout": 45,
+    "request_retries": 2
 }
